@@ -19,6 +19,7 @@ logging.getLogger("gradio_client").setLevel(logging.WARNING)
 MODEL_DIR = Path("/workspace/gemma-3-1b-it")
 GSM8K_DIR = Path("/workspace/gsm8k-grade-school-math-8k-dataset/gsm8k/main")
 PROJECT_NAME = "GRPO-Mathematical-Reasoning"
+GEMMA_STOP_TOKEN_IDS = [1, 106]  # <eos>, <end_of_turn>
 
 SYSTEM_PROMPT = """
 Respond in the following format:
@@ -150,6 +151,14 @@ def load_model_and_tokenizer(use_lora=True, lora_rank=32):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    end_of_turn_id = tokenizer.convert_tokens_to_ids("<end_of_turn>")
+    if end_of_turn_id in GEMMA_STOP_TOKEN_IDS:
+        # TRL's built-in truncation mask checks tokenizer.eos_token_id as a scalar.
+        # Gemma chat completions usually stop on <end_of_turn> (106), while the
+        # config also lists <eos> (1). Point the tokenizer EOS at the chat stop
+        # token so mask_truncated_completions handles normal chat endings.
+        tokenizer.eos_token = "<end_of_turn>"
+
     if use_lora:
         lora_config = LoraConfig(
             r=lora_rank,
@@ -213,6 +222,7 @@ def build_training_args(
         vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
         vllm_max_model_length=vllm_max_model_length,
         vllm_enable_sleep_mode=False,
+        generation_kwargs={"stop_token_ids": GEMMA_STOP_TOKEN_IDS},
         output_dir=output_dir,
         run_name=run_name,
         project=PROJECT_NAME,
@@ -279,13 +289,14 @@ def attach_essential_metrics(trainer, tokenizer):
 
             max_len = getattr(self.args, "max_completion_length", None)
             if max_len is not None:
-                eos_or_pad = {tokenizer.eos_token_id, tokenizer.pad_token_id}
+                eos_or_pad = set(GEMMA_STOP_TOKEN_IDS)
+                eos_or_pad.add(tokenizer.pad_token_id)
                 clipped = []
                 for ids in completion_ids_list:
                     hit_length_limit = len(ids) >= max_len
                     ended_cleanly = bool(ids) and ids[-1] in eos_or_pad
                     clipped.append(float(hit_length_limit and not ended_cleanly))
-                log_metric(store, "completions/clipped_ratio", sum(clipped) / len(clipped))
+                log_metric(store, "completions/gemma_clipped_ratio", sum(clipped) / len(clipped))
 
         responses = [completion_text(completion) for completion in completions]
         if responses:
